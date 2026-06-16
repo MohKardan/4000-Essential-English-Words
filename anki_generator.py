@@ -20,6 +20,18 @@ STYLE = """
     padding: 20px;
 }
 
+/* Night Mode adjustments */
+.nightMode {
+    background-color: #121212 !important;
+    color: #e0e0e0 !important;
+}
+
+.nightMode .word { color: #ffffff !important; }
+.nightMode .pron { color: #cccccc !important; }
+.nightMode .example { color: #a0cfff !important; }
+.nightMode .def { color: #dddddd !important; }
+.nightMode .hint { color: #999999 !important; }
+
 .word {
     font-size: 36px;
     font-weight: bold;
