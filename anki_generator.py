@@ -19,7 +19,16 @@ STYLE = """
     line-height: 1.6;
     padding: 20px;
 }
-
+#rubric {
+  text-align: center;
+  padding: 4px;
+  padding-left: 10px;
+  padding-right: 10px;
+  margin-bottom: 10px;
+  background: #1d6695;
+  color: white;
+  font-weight: 500;
+}
 /* Night Mode adjustments */
 .nightMode {
     background-color: #121212 !important;
@@ -45,7 +54,7 @@ STYLE = """
 
 .exam {
     font-size: 22px;
-    color: #2c3e50;
+    color: #cc3e50;
     margin-top: 10px;
 }
 
@@ -83,17 +92,18 @@ my_model = genanki.Model(
     templates=[
         {
             "name": "Card 1",
-            "qfmt": '<div class="word">{{Word}}</div>'
+            "qfmt": '<div id="rubric">4000 EEW (Old Books)</div>'
+            '<div class="word">{{Word}}</div>'
             '<div class="pron">{{Pronunciation}}</div>'
-            '<br>'
+            '<hr>'
             '<div class="hint">{{hint:Hint}}</div>',
 
             "afmt": '{{FrontSide}}<hr id="answer">'
             '<br>{{Image}}'
             '<div class="def">{{Definition}}</div>'
-            '<br>'
+            '<hr>'
             '<div class="exam">{{Example}}</div>'
-            '<br>{{Audio}}',
+            '<hr>{{Audio}}',
         }
     ],
     css=STYLE
