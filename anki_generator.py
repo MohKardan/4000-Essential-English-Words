@@ -3,6 +3,12 @@ import os
 import genanki
 import re
 
+import spacy
+from bs4 import BeautifulSoup
+
+# Load spaCy model
+nlp = spacy.load("en_core_web_sm")
+
 # Unique IDs - Keep these constant to allow future updates
 MODEL_ID = 1607392319
 # Base ID for the main deck
@@ -109,6 +115,38 @@ my_model = genanki.Model(
     css=STYLE
 )
 
+def extract_text_from_html(html):
+    """
+    Remove HTML tags but keep the text content.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    return soup.get_text(" ")
+
+
+def find_sentence_with_word(html_story, target_word):
+    """
+    Find the first sentence containing the target word
+    using lemma-based matching.
+    """
+
+    # Extract plain text
+    text = extract_text_from_html(html_story)
+
+    # Process with spaCy
+    doc = nlp(text)
+
+    target_word = target_word.lower()
+
+    # Iterate sentences
+    for sent in doc.sents:
+        for token in sent:
+
+            if token.lemma_.lower() == target_word:
+                return sent.text.strip()
+
+    #return None
+    return "Context not found."
+
 def get_sentence_with_word(story_text, word):
     """
     Extracts the full sentence containing the specific word from the story text.
@@ -120,6 +158,7 @@ def get_sentence_with_word(story_text, word):
     
     # Return the matched sentence or a fallback if not found
     return match.group(1).strip() if match else "Context not found."
+
 
 def create_deck(book_id, book_folder):
     """
@@ -142,6 +181,9 @@ def create_deck(book_id, book_folder):
     for unit in data["flashcard"]:
         if "wordlist" not in unit:
             continue
+        
+        unit_tag = unit["en"].replace(" ", "")
+        print(f"Unit: {unit["en"]}")
 
         story_text = unit['reading'][0].get("story", "")
 
@@ -153,8 +195,11 @@ def create_deck(book_id, book_folder):
             image_name = entry.get("image", "")
             audio_name = entry.get("sound", "")
             # Extract the sentence from the story text using the helper function
-            hint_sentence = get_sentence_with_word(story_text, word)
-            print(f"Hint: {hint_sentence}")
+            #hint_sentence = get_sentence_with_word(story_text, word)
+            hint_sentence = find_sentence_with_word(story_text, word)
+
+            #print(f"Hint: {hint_sentence}")
+
             image_path = os.path.join(book_folder, "images", image_name)
             audio_path = os.path.join(book_folder, "audio", audio_name)
 
@@ -174,6 +219,11 @@ def create_deck(book_id, book_folder):
                     f'<img src="{image_name}">',
                     f'[sound:{audio_name}]'
                 ],
+                tags=[
+                    f"Book{book_id}",
+                    f"{unit_tag}",
+                    f"Book{book_id}::{unit_tag}"
+                ]
             )
             deck.add_note(note)
             #break
