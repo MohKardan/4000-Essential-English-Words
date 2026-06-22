@@ -3,16 +3,19 @@ import os
 import genanki
 import re
 
+#https://github.com/stanfordnlp/stanza/tree/main
 import spacy
 from bs4 import BeautifulSoup
 
 # Load spaCy model
-nlp = spacy.load("en_core_web_sm")
+nlp = spacy.load("en_core_web_lg", disable=["ner"])
+nlp.add_pipe("sentencizer", before="parser")
+nlp.get_pipe("lemmatizer").lookups
 
 # Unique IDs - Keep these constant to allow future updates
-MODEL_ID = 1607392319
+MODEL_ID = 1782130091
 # Base ID for the main deck
-BASE_DECK_ID = 2059400811
+BASE_DECK_ID = 2026062215
 
 # CSS for centering content and basic styling
 STYLE = """
@@ -85,7 +88,7 @@ img {
 
 my_model = genanki.Model(
     MODEL_ID,
-    "4000 Essential English Words Model",
+    "4000 EEW (Old Books) Model",
     fields=[
         {"name": "Word"},
         {"name": "Pronunciation"},
@@ -122,6 +125,19 @@ def extract_text_from_html(html):
     soup = BeautifulSoup(html, "html.parser")
     return soup.get_text(" ")
 
+def clean_text(html_text):
+    text = extract_text_from_html(html_text)
+
+    text = text.replace("“", '"').replace("”", '"')
+    text = text.replace("’", "'")
+
+    text = re.sub(r"\s+", " ", text)
+
+    text = re.sub(r"\s+\.", ".", text)
+    text = re.sub(r"\s+!", "!", text)
+    text = re.sub(r"\s+\?", "?", text)
+
+    return text.strip()
 
 def find_sentence_with_word(html_story, target_word):
     """
@@ -130,20 +146,28 @@ def find_sentence_with_word(html_story, target_word):
     """
 
     # Extract plain text
-    text = extract_text_from_html(html_story)
+    text = clean_text(html_story)
 
     # Process with spaCy
     doc = nlp(text)
 
-    target_word = target_word.lower()
-
+    target_lemma = nlp(target_word+".")[0].lemma_.lower()
+    print("target_word:", target_word)
+    print("target_lemma:", target_lemma)
     # Iterate sentences
     for sent in doc.sents:
+        print("target_word:", target_word)
+        print("target_lemma:", target_lemma)
+        print("SENT:", sent.text)
         for token in sent:
-
-            if token.lemma_.lower() == target_word:
+            print("  TOKEN:", token.text, token.lemma_)
+            if (
+                token.text.lower() == target_word.lower()
+                or token.lemma_.lower() == target_lemma
+            ):
                 return sent.text.strip()
-
+ 
+    print("Context not found.")
     #return None
     return "Context not found."
 
@@ -160,13 +184,18 @@ def get_sentence_with_word(story_text, word):
     return match.group(1).strip() if match else "Context not found."
 
 
-def create_deck(book_id, book_folder):
+def create_deck(book_id):
     """
     book_id: integer from 1 to 6
     book_folder: path to the folder containing data.json, images, and audio
     """
+
+    print(f"--Book: {book_id}")
+
+    book_folder = f"output/book{book_id}"
+
     # Hierarchical deck naming: Parent::Child
-    deck_name = f"4000 Essential English Words (Old Books)::Book {book_id}"
+    deck_name = f"4000 EEW (Old Books)::Book {book_id}"
     
     # Generate a unique ID for each sub-deck based on the book number
     current_deck_id = BASE_DECK_ID + book_id
@@ -183,12 +212,17 @@ def create_deck(book_id, book_folder):
             continue
         
         unit_tag = unit["en"].replace(" ", "")
-        print(f"Unit: {unit["en"]}")
-
+        print(f"----Unit: {unit["en"]}")
+        if "Unit2" != unit_tag:
+            continue
         story_text = unit['reading'][0].get("story", "")
 
         for entry in unit["wordlist"]:
             word = entry.get("en", "")
+
+            if word != "scare":
+                continue
+
             pron = entry.get("pron", "")
             definition = entry.get("desc", "")
             example = entry.get("exam", "")
@@ -226,14 +260,15 @@ def create_deck(book_id, book_folder):
                 ]
             )
             deck.add_note(note)
-            #break
+            if word == "scare":
+                break
         #break
     package = genanki.Package(deck)
     package.media_files = media_files
-    output_file = f"4000_Essential_English_Words_Book_{book_id}.apkg"
+    output_file = f"4000EEW_Old_Book_{book_id}.apkg"
     package.write_to_file(output_file)
     print(f"Generated: {output_file}")
     
 if __name__ == "__main__":
-    # Example for Book 1
-    create_deck(1, "output/book1")
+    for i in range(1,2):
+        create_deck(i)
