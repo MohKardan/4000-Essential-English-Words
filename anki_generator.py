@@ -2,15 +2,25 @@ import json
 import os
 import genanki
 import re
-
-#https://github.com/stanfordnlp/stanza/tree/main
-import spacy
 from bs4 import BeautifulSoup
 
+import spacy
 # Load spaCy model
-nlp = spacy.load("en_core_web_lg", disable=["ner"])
-nlp.add_pipe("sentencizer", before="parser")
-nlp.get_pipe("lemmatizer").lookups
+nlp_spaCy = spacy.load("en_core_web_lg", disable=["ner"])
+nlp_spaCy.add_pipe("sentencizer", before="parser")
+nlp_spaCy.get_pipe("lemmatizer").lookups
+
+#https://github.com/stanfordnlp/stanza/tree/main
+import stanza
+stanza.download("en")
+# =========================
+# Load Stanza pipeline
+# =========================
+nlp_stanza = stanza.Pipeline(
+    lang="en",
+    processors="tokenize,pos,lemma",
+    use_gpu=False
+)
 
 # Unique IDs - Keep these constant to allow future updates
 MODEL_ID = 1782130091
@@ -139,7 +149,8 @@ def clean_text(html_text):
 
     return text.strip()
 
-def find_sentence_with_word(html_story, target_word):
+#spaCy
+def find_sentence_with_word_spaCy(html_story, target_word):
     """
     Find the first sentence containing the target word
     using lemma-based matching.
@@ -149,11 +160,13 @@ def find_sentence_with_word(html_story, target_word):
     text = clean_text(html_story)
 
     # Process with spaCy
-    doc = nlp(text)
+    doc = nlp_spaCy(text)
 
-    target_lemma = nlp(target_word+".")[0].lemma_.lower()
+    target_lemma = list(nlp_spaCy(target_word))[0].lemma_.lower()
+
     print("target_word:", target_word)
     print("target_lemma:", target_lemma)
+
     # Iterate sentences
     for sent in doc.sents:
         print("target_word:", target_word)
@@ -164,6 +177,40 @@ def find_sentence_with_word(html_story, target_word):
             if (
                 token.text.lower() == target_word.lower()
                 or token.lemma_.lower() == target_lemma
+            ):
+                return sent.text.strip()
+ 
+    return find_sentence_with_word_Stanza(html_story, target_word)
+
+#Stanza
+def find_sentence_with_word_Stanza(html_story, target_word):
+    """
+    Find the first sentence containing the target word
+    using lemma-based matching.
+    """
+
+    # Extract plain text
+    text = clean_text(html_story)
+
+    # Process with Stanza
+    doc = nlp_stanza(text)
+
+    nlp_target = nlp_stanza(target_word)
+    target_lemma = nlp_target.sentences[0].words[0].lemma.lower()
+
+    print("target_word:", target_word)
+    print("target_lemma:", target_lemma)
+
+    # Iterate sentences
+    for sent in doc.sentences:
+        print("target_word:", target_word)
+        print("target_lemma:", target_lemma)
+        print("SENT:", sent.text)
+        for token in sent.words:
+            print("  TOKEN:", token.text, token.lemma)
+            if (
+                token.text.lower() == target_word.lower()
+                or token.lemma.lower() == target_lemma
             ):
                 return sent.text.strip()
  
@@ -182,7 +229,6 @@ def get_sentence_with_word(story_text, word):
     
     # Return the matched sentence or a fallback if not found
     return match.group(1).strip() if match else "Context not found."
-
 
 def create_deck(book_id):
     """
@@ -213,15 +259,15 @@ def create_deck(book_id):
         
         unit_tag = unit["en"].replace(" ", "")
         print(f"----Unit: {unit["en"]}")
-        if "Unit2" != unit_tag:
-            continue
+        
+        #if "Unit2" != unit_tag: continue
+
         story_text = unit['reading'][0].get("story", "")
 
         for entry in unit["wordlist"]:
             word = entry.get("en", "")
 
-            if word != "scare":
-                continue
+            #if word != "scare": continue
 
             pron = entry.get("pron", "")
             definition = entry.get("desc", "")
@@ -230,7 +276,7 @@ def create_deck(book_id):
             audio_name = entry.get("sound", "")
             # Extract the sentence from the story text using the helper function
             #hint_sentence = get_sentence_with_word(story_text, word)
-            hint_sentence = find_sentence_with_word(story_text, word)
+            hint_sentence = find_sentence_with_word_spaCy(story_text, word)
 
             #print(f"Hint: {hint_sentence}")
 
@@ -260,8 +306,7 @@ def create_deck(book_id):
                 ]
             )
             deck.add_note(note)
-            if word == "scare":
-                break
+            #if word == "scare": break
         #break
     package = genanki.Package(deck)
     package.media_files = media_files
@@ -270,5 +315,5 @@ def create_deck(book_id):
     print(f"Generated: {output_file}")
     
 if __name__ == "__main__":
-    for i in range(1,2):
+    for i in range(1,7):
         create_deck(i)
