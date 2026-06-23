@@ -164,16 +164,16 @@ def find_sentence_with_word_spaCy(html_story, target_word):
 
     target_lemma = list(nlp_spaCy(target_word))[0].lemma_.lower()
 
-    print("target_word:", target_word)
-    print("target_lemma:", target_lemma)
+    #print("target_word:", target_word)
+    #print("target_lemma:", target_lemma)
 
     # Iterate sentences
     for sent in doc.sents:
-        print("target_word:", target_word)
-        print("target_lemma:", target_lemma)
-        print("SENT:", sent.text)
+        #print("target_word:", target_word)
+        #print("target_lemma:", target_lemma)
+        #print("SENT:", sent.text)
         for token in sent:
-            print("  TOKEN:", token.text, token.lemma_)
+            #print("  TOKEN:", token.text, token.lemma_)
             if (
                 token.text.lower() == target_word.lower()
                 or token.lemma_.lower() == target_lemma
@@ -198,16 +198,16 @@ def find_sentence_with_word_Stanza(html_story, target_word):
     nlp_target = nlp_stanza(target_word)
     target_lemma = nlp_target.sentences[0].words[0].lemma.lower()
 
-    print("target_word:", target_word)
-    print("target_lemma:", target_lemma)
+    #print("target_word:", target_word)
+    #print("target_lemma:", target_lemma)
 
     # Iterate sentences
     for sent in doc.sentences:
-        print("target_word:", target_word)
-        print("target_lemma:", target_lemma)
-        print("SENT:", sent.text)
+        #print("target_word:", target_word)
+        #print("target_lemma:", target_lemma)
+        #print("SENT:", sent.text)
         for token in sent.words:
-            print("  TOKEN:", token.text, token.lemma)
+            #print("  TOKEN:", token.text, token.lemma)
             if (
                 token.text.lower() == target_word.lower()
                 or token.lemma.lower() == target_lemma
@@ -310,7 +310,7 @@ def create_deck(book_id):
         #break
     package = genanki.Package(deck)
     package.media_files = media_files
-    output_file = f"4000EEW_Old_Book_{book_id}.apkg"
+    output_file = f"output/4000EEW_Old_Book_{book_id}.apkg"
     package.write_to_file(output_file)
     print(f"Generated: {output_file}")
     
