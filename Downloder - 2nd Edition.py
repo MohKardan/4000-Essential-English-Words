@@ -1,17 +1,29 @@
 import json
+import re
+import time
 import requests
 from pathlib import Path
+from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from bs4 import BeautifulSoup
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
 PROXY = "http://127.0.0.1:10808"
 
+SITE = "https://www.essentialenglish.review"
+
 BOOK_IDS = range(1, 7)
 
-BASE = "https://www.essentialenglish.review/apps-data"
-
 OUTPUT_DIR = Path("output/2nd-edition")
+
+SLEEP_BETWEEN_UNITS = 1
+
+# ---------------------------------------------------------------------------
+# HTTP session
+# ---------------------------------------------------------------------------
 
 proxies = {
     "http": PROXY,
@@ -23,9 +35,11 @@ session = requests.Session()
 session.proxies.update(proxies)
 
 session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "*/*",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,*/*",
 })
 
 retry = Retry(
@@ -39,17 +53,20 @@ adapter = HTTPAdapter(max_retries=retry)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
 
+# ---------------------------------------------------------------------------
+# Network helpers
+# ---------------------------------------------------------------------------
 
-def fetch_json(url):
+def fetch_html(url):
 
-    print("[DEBUG] Fetching JSON:", url)
+    print("[FETCH]", url)
 
     r = session.get(url, timeout=60)
 
     if r.status_code != 200:
-        raise RuntimeError(f"Failed to fetch {url}")
+        raise RuntimeError(f"HTTP {r.status_code} for {url}")
 
-    return r.content.decode("utf-8-sig")
+    return r.text
 
 
 def download(url, path):
@@ -64,7 +81,7 @@ def download(url, path):
 
         with session.get(url, stream=True, timeout=60) as r:
 
-            if r.status_code != 200:
+            if r.status_code not in (200, 206):
                 print("[FAIL]", url)
                 return
 
@@ -78,125 +95,205 @@ def download(url, path):
 
         print("[ERROR]", url, e)
 
+# ---------------------------------------------------------------------------
+# Scraping helpers
+# ---------------------------------------------------------------------------
 
-def parse_reading(reading_html):
+def get_unit_slugs(book_id):
     """
-    Extracts word entries and exercise media URLs from the reading HTML field.
-
-    Returns a tuple of (words, exercise_image_src, exercise_audio_src):
-      - words: list of dicts with keys: word, image, pronunciation, meaning, example
-      - exercise_image_src: absolute path from <img class="img-app-small"> src attribute
-      - exercise_audio_src: absolute path from <audio> src attribute
+    Fetches the book index page and returns an ordered list of unit page paths.
+    Unit nav links follow: /book/{book-slug}/unit-{n}-{story-title}#{n-1}
+    The hash fragment is stripped; duplicates are removed while preserving order.
     """
 
-    words = []
-    exercise_image_src = ""
-    exercise_audio_src = ""
+    index_url = f"{SITE}/4000-essential-english-words-{book_id}-2nd-edition/"
 
-    if not reading_html:
-        return words, exercise_image_src, exercise_audio_src
+    html = fetch_html(index_url)
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    prefix = f"/book/4000-essential-english-words-{book_id}-2nd-edition/unit-"
+
+    slugs = []
+    seen = set()
+
+    for a in soup.find_all("a", href=True):
+
+        href = a["href"]
+
+        if href.startswith(prefix) and "#" in href:
+
+            slug = href.split("#")[0]
+
+            if slug not in seen:
+                seen.add(slug)
+                slugs.append(slug)
+
+    return slugs
+
+
+def parse_unit_page(html, book_id):
+    """
+    Extracts all data needed to build one flashcard entry from a unit page.
+
+    Returns a dict matching the data.json flashcard schema:
+        image   - story image filename (extracted from <img class="img-app-small"> src)
+        en      - unit title (from <title> tag)
+        desc    - empty string (not present on unit pages)
+        reading - inner HTML of <div class="page-content"> with story src paths
+                  rewritten to use the correct book number
+    """
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # -- en: unit title from <title> tag
+    title_tag = soup.find("title")
+    en = title_tag.get_text(strip=True) if title_tag else ""
+
+    # -- desc: not available on unit pages
+    desc = ""
+
+    # -- reading: inner HTML of page-content div, minified to match the
+    # compact single-line format of the original data.json
+    page_content = soup.find("div", class_="page-content")
+
+    if not page_content:
+        return {"image": "", "en": en, "desc": desc, "reading": ""}
+
+    # Strip newlines and inter-tag whitespace to produce a compact single-line
+    # string, matching the format of the original data.json reading field.
+    reading_html = re.sub(r"\n\s*", "", page_content.decode_contents())
+
+    # Rewrite hardcoded book-1 src paths to the correct book number.
+    # The site embeds /apps-data/4000-essential-english-words-1-2nd-edition/
+    # in every unit page regardless of which book it belongs to.
+    wrong_book_path = "/apps-data/4000-essential-english-words-1-2nd-edition/"
+    correct_book_path = f"/apps-data/4000-essential-english-words-{book_id}-2nd-edition/"
+
+    reading_html = reading_html.replace(wrong_book_path, correct_book_path)
+
+    # -- image: story image filename from the corrected reading HTML
+    reading_soup = BeautifulSoup(reading_html, "html.parser")
+
+    img_tag = reading_soup.find("img", class_="img-app-small")
+    image = img_tag["src"].split("/")[-1] if img_tag else ""
+
+    return {
+        "image": image,
+        "en": en,
+        "desc": desc,
+        "reading": reading_html,
+    }
+
+# ---------------------------------------------------------------------------
+# Media download helpers
+# ---------------------------------------------------------------------------
+
+def download_unit_media(reading_html, book, images_dir, audio_dir):
+    """
+    Downloads all media files referenced in a unit's reading HTML:
+      - story image and story audio (from exercise/ path)
+      - wordlist images and audio (from wordlist/ path)
+    """
 
     soup = BeautifulSoup(reading_html, "html.parser")
 
+    # Story image
+    img_tag = soup.find("img", class_="img-app-small")
+    if img_tag:
+        src = img_tag.get("src", "")
+        filename = src.split("/")[-1]
+        download(f"{SITE}{src}", images_dir / filename)
+
+    # Story audio
+    audio_tag = soup.find("audio")
+    if audio_tag:
+        src = audio_tag.get("src", "")
+        filename = src.split("/")[-1]
+        download(f"{SITE}{src}", audio_dir / filename)
+
+    # Wordlist images and audio
     for li in soup.find_all("li", attrs={"word": True}):
 
         word = li.get("word", "").strip()
         image = li.get("img", "").strip()
-        pronunciation = li.get("pro", "").strip()
 
-        divs = li.find_all("div", recursive=False)
+        if image:
+            img_url = f"{SITE}/apps-data/{book}/data/wordlist/{image}"
+            download(img_url, images_dir / image)
 
-        meaning = divs[0].get_text(separator=" ", strip=True) if len(divs) > 0 else ""
-        example = divs[1].get_text(separator=" ", strip=True) if len(divs) > 1 else ""
+        if word:
+            sound_name = f"{word}.mp3"
+            audio_url = f"{SITE}/apps-data/{book}/data/wordlist/{sound_name}"
+            download(audio_url, audio_dir / sound_name)
 
-        words.append({
-            "word": word,
-            "image": image,
-            "pronunciation": pronunciation,
-            "meaning": meaning,
-            "example": example,
-        })
-
-    img_tag = soup.find("img", class_="img-app-small")
-    if img_tag:
-        exercise_image_src = img_tag.get("src", "").strip()
-
-    audio_tag = soup.find("audio")
-    if audio_tag:
-        exercise_audio_src = audio_tag.get("src", "").strip()
-
-    return words, exercise_image_src, exercise_audio_src
-
+# ---------------------------------------------------------------------------
+# Main processing
+# ---------------------------------------------------------------------------
 
 def process_book(book_id):
 
     book = f"4000-essential-english-words-{book_id}-2nd-edition"
 
-    print("\n====== BOOK", book_id, "======")
-
-    json_url = f"{BASE}/{book}/data/data.json"
+    print(f"\n====== BOOK {book_id} ======")
 
     book_dir = OUTPUT_DIR / f"book{book_id}"
-
     images_dir = book_dir / "images"
-
     audio_dir = book_dir / "audio"
 
     book_dir.mkdir(parents=True, exist_ok=True)
 
-    text = fetch_json(json_url)
+    unit_slugs = get_unit_slugs(book_id)
 
-    (book_dir / "data.json").write_text(text, encoding="utf-8")
+    print(f"Units found: {len(unit_slugs)}")
 
-    data = json.loads(text)
+    flashcards = []
 
-    for unit_index, card in enumerate(data["flashcard"], start=1):
+    for unit_index, slug in enumerate(unit_slugs, start=1):
 
-        unit_title = card.get("en", f"Unit {unit_index}")
+        unit_name = slug.split("/")[-1]
 
-        print(f"[UNIT {unit_index}] {unit_title}")
+        print(f"\n[UNIT {unit_index}] {unit_name}")
 
-        words, exercise_image_src, exercise_audio_src = parse_reading(card.get("reading", ""))
+        try:
+            html = fetch_html(f"{SITE}{slug}")
+        except Exception as e:
+            print("[UNIT FAILED]", e)
+            continue
 
-        print(f"  Words found: {len(words)}")
+        card = parse_unit_page(html, book_id)
 
-        if exercise_image_src:
-            filename = exercise_image_src.split("/")[-1]
-            cover_url = f"https://www.essentialenglish.review{exercise_image_src}"
-            download(cover_url, images_dir / filename)
+        words_count = len(BeautifulSoup(card["reading"], "html.parser").find_all("li", attrs={"word": True}))
+        print(f"  Words found: {words_count}")
 
-        if exercise_audio_src:
-            filename = exercise_audio_src.split("/")[-1]
-            cover_audio_url = f"https://www.essentialenglish.review{exercise_audio_src}"
-            download(cover_audio_url, audio_dir / filename)
+        flashcards.append(card)
 
-        for word_entry in words:
+        download_unit_media(card["reading"], book, images_dir, audio_dir)
 
-            image_name = word_entry["image"]
-            word = word_entry["word"]
+        time.sleep(SLEEP_BETWEEN_UNITS)
 
-            if image_name:
-                img_url = f"{BASE}/{book}/data/wordlist/{image_name}"
-                download(img_url, images_dir / image_name)
+    # Save data.json in the same schema as the original
+    data = {"flashcard": flashcards}
 
-            sound_name = f"{word}.mp3"
-            audio_url = f"{BASE}/{book}/data/wordlist/{sound_name}"
-            download(audio_url, audio_dir / sound_name)
+    data_json_path = book_dir / "data.json"
+    data_json_path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    print(f"\n[SAVED] {data_json_path}  ({len(flashcards)} units)")
 
 
 def main():
 
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    for book in BOOK_IDS:
+    for book_id in BOOK_IDS:
 
         try:
-
-            process_book(book)
-
+            process_book(book_id)
         except Exception as e:
-
-            print("[BOOK FAILED]", book, e)
+            print("[BOOK FAILED]", book_id, e)
 
 
 if __name__ == "__main__":
