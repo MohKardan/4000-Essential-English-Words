@@ -30,6 +30,17 @@ environment variable. Get a key with no signup at:
 or:
     curl -X POST https://inference.dahl.global/tokens
 
+Requests are routed through --proxy (default http://127.0.0.1:10808, the
+same local proxy the Downloder scripts use) since this network cannot
+reach external hosts directly. Pass --no-proxy to disable it.
+
+Like add_hints_to_shared_deck.py, this edits the collection in place:
+note ids/GUIDs are untouched (only FaMeaning/FaExample + mod/usn change),
+so importing the output into a profile that already studies this deck
+updates the translation without resetting review history. It also
+transparently handles apkg files that use the newer zstd-compressed
+collection.anki21b format instead of the legacy collection.anki2.
+
 Notes:
 - Dahl is an OpenAI-compatible API over open-weight chat models, not a
   dedicated translation service like DeepL. This script prompts the
@@ -42,8 +53,12 @@ Notes:
 - As of this writing, available model ids include:
     MiniMaxAI/MiniMax-M2.7   (default -- general chat and coding)
     moonshotai/Kimi-K2.6     (long-context / reasoning)
-  zai-org/GLM-5.2 is listed on the network but marked "coming soon"
-  and is not yet available for inference.
+    zai-org/GLM-5.2-FP8
+- All currently available models are reasoning models that prepend a
+  <think>...</think> block to their answer. clean_translation() strips
+  it, and max_tokens is set generously (600) so the model has room to
+  finish thinking AND emit the actual translation -- a low max_tokens
+  truncates the response mid-<think>, before any Persian text appears.
 - Skips notes that already have a Persian translation unless
   --overwrite is passed.
 - Leaves all media (images/audio) untouched.
@@ -52,6 +67,7 @@ Notes:
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -65,6 +81,12 @@ except ImportError:
     print("The 'requests' package is not installed. Run: pip install requests --break-system-packages")
     sys.exit(1)
 
+try:
+    import zstandard
+except ImportError:
+    print("The 'zstandard' package is not installed. Run: pip install zstandard --break-system-packages")
+    sys.exit(1)
+
 FIELD_SEP = "\x1f"
 
 # Field names to look for (change these here if your field names differ)
@@ -75,6 +97,7 @@ DST_EXAMPLE = "FaExample"
 
 BASE_URL = "https://inference.dahl.global/v1"
 DEFAULT_MODEL = "MiniMaxAI/MiniMax-M2.7"
+DEFAULT_PROXY = "http://127.0.0.1:10808"
 
 SYSTEM_PROMPT = (
     "You are a professional English-to-Persian translator working on "
@@ -85,28 +108,78 @@ SYSTEM_PROMPT = (
 )
 
 
-def extract_apkg(apkg_path: Path, work_dir: Path) -> Path:
-    """Extract the apkg and return the path to the collection database file."""
-    with zipfile.ZipFile(apkg_path, "r") as z:
-        z.extractall(work_dir)
-
-    # Most exports use collection.anki2; some newer versions use anki21/anki21b
-    for name in ("collection.anki21", "collection.anki2", "collection.anki21b"):
-        candidate = work_dir / name
-        if candidate.exists():
-            return candidate
-
-    raise FileNotFoundError("Could not find collection.anki2/anki21 inside the apkg.")
+def _unicase(a: str, b: str) -> int:
+    """Case-insensitive stand-in for Anki's custom 'unicase' SQLite collation."""
+    la, lb = a.lower(), b.lower()
+    return (la > lb) - (la < lb)
 
 
-def get_models(conn: sqlite3.Connection) -> dict:
+def connect(path) -> sqlite3.Connection:
+    """sqlite3.connect() with Anki's 'unicase' collation registered.
+
+    Newer (anki21b) collections declare text columns like notetypes.name
+    with COLLATE unicase; without registering it, any query touching those
+    columns raises "no such collation sequence: unicase".
     """
-    Return the note type models from the col table.
+    conn = sqlite3.connect(path)
+    conn.create_collation("unicase", _unicase)
+    return conn
+
+
+def load_collection(work_dir: Path):
+    """
+    Extracts the apkg's collection database and returns (kind, sqlite_path).
+
+    Newer Anki exports keep an empty legacy collection.anki2 stub alongside
+    the real, zstd-compressed collection.anki21b -- picking "whichever file
+    exists first" (as this script used to) silently opens the empty stub.
+    Instead, decompress anki21b if present and pick whichever candidate
+    actually holds notes.
+    """
+    candidates = []
+
+    anki21b = work_dir / "collection.anki21b"
+    if anki21b.exists():
+        decompressed = zstandard.ZstdDecompressor().decompress(
+            anki21b.read_bytes(), max_output_size=500 * 1024 * 1024
+        )
+        decoded_path = work_dir / "_collection21b_decoded.sqlite"
+        decoded_path.write_bytes(decompressed)
+        candidates.append(("anki21b", decoded_path))
+
+    anki2 = work_dir / "collection.anki2"
+    if anki2.exists():
+        candidates.append(("anki2", anki2))
+
+    if not candidates:
+        raise FileNotFoundError("No collection.anki2 / collection.anki21b found inside the apkg.")
+
+    best = None
+    for kind, path in candidates:
+        conn = connect(path)
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+        finally:
+            conn.close()
+        if best is None or count > best[2]:
+            best = (kind, path, count)
+
+    return best[0], best[1]
+
+
+def get_models(conn: sqlite3.Connection, kind: str) -> dict:
+    """
+    Return the note type models, regardless of schema kind.
     Output: { model_id(str): {"name": ..., "flds": [field_name, ...]} }
     """
-    cur = conn.cursor()
-    cur.execute("SELECT models FROM col")
-    row = cur.fetchone()
+    if kind == "anki21b":
+        result = {}
+        for ntid, name in conn.execute("SELECT id, name FROM notetypes"):
+            rows = conn.execute("SELECT ord, name FROM fields WHERE ntid=? ORDER BY ord", (ntid,)).fetchall()
+            result[str(ntid)] = {"name": name, "flds": [n for _ord, n in rows]}
+        return result
+
+    row = conn.execute("SELECT models FROM col").fetchone()
     models_json = json.loads(row[0])
 
     result = {}
@@ -116,14 +189,42 @@ def get_models(conn: sqlite3.Connection) -> dict:
     return result
 
 
-def check_model_available(model_id: str) -> None:
+def repackage(work_dir: Path, kind: str, sqlite_path: Path, output_path: Path):
+    if kind == "anki21b":
+        compressed = zstandard.ZstdCompressor().compress(sqlite_path.read_bytes())
+        (work_dir / "collection.anki21b").write_bytes(compressed)
+
+    if output_path.exists():
+        output_path.unlink()
+
+    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for item in work_dir.rglob("*"):
+            if not item.is_file():
+                continue
+            if item.name == "_collection21b_decoded.sqlite":
+                continue
+            if item.suffix in (".wal", ".shm", "-journal"):
+                continue
+            zf.write(item, item.relative_to(work_dir))
+
+    print(f"Output file saved: {output_path}")
+
+
+def make_session(proxy: str | None) -> requests.Session:
+    session = requests.Session()
+    if proxy:
+        session.proxies.update({"http": proxy, "https": proxy})
+    return session
+
+
+def check_model_available(session: requests.Session, model_id: str) -> None:
     """
     Query GET /v1/models (public, no auth) and warn if the requested
     model id is not currently listed. Does not raise -- Dahl's own
     docs note that ids can rotate, so this check is advisory only.
     """
     try:
-        resp = requests.get(f"{BASE_URL}/models", timeout=15)
+        resp = session.get(f"{BASE_URL}/models", timeout=15)
         resp.raise_for_status()
         data = resp.json()
         available_ids = [m.get("id") for m in data.get("data", [])]
@@ -137,9 +238,15 @@ def check_model_available(model_id: str) -> None:
         print("Continuing anyway -- pass a different --model if requests start failing.")
 
 
+THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
 def clean_translation(text: str) -> str:
     """Strip common wrapping artifacts a chat model may add despite instructions."""
-    text = text.strip()
+    # All currently available Dahl models are reasoning models: they
+    # prepend a <think>...</think> block with their reasoning before the
+    # actual answer. Only the text after it is the translation.
+    text = THINK_BLOCK_RE.sub("", text).strip()
 
     # Strip a leading English label like "Translation:" or "Persian:"
     for prefix in ("Translation:", "Persian:", "Farsi:"):
@@ -156,36 +263,52 @@ def clean_translation(text: str) -> str:
     return text
 
 
-def call_dahl_chat(api_key: str, model: str, text: str, max_retries: int = 4) -> str:
+def call_dahl_chat(session: requests.Session, api_key: str, model: str, text: str, max_retries: int = 4) -> tuple[str, dict]:
     """
     Send a single chat completion request to Dahl asking for a Persian
-    translation of `text`, and return the cleaned translated string.
+    translation of `text`, and return (cleaned_translation, usage) where
+    usage is the API's token-count dict ({"prompt_tokens", "completion_tokens",
+    "total_tokens"}, empty if the API didn't report it).
     Retries with short exponential backoff on 429/503/5xx, per Dahl's
     own documented guidance for handling network/node overload.
     """
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        # Force a fresh connection per request. A pooled/kept-alive
+        # connection through a flaky local proxy can go half-dead (proxy
+        # drops it without a TCP FIN/RST); requests then blocks waiting on
+        # a socket that will never respond, which looks like a hang rather
+        # than a clean, retryable error.
+        "Connection": "close",
     }
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": text},
-        ],
-        "temperature": 0.2,
-        "max_tokens": 200,
-    }
-
     delay = 2.0
     for attempt in range(1, max_retries + 1):
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ],
+            "temperature": 0.2,
+            # Generous, and growing on each retry: these are reasoning
+            # models that spend a good chunk of the budget on a <think>
+            # block before the real answer. temperature=0.2 means a retry
+            # with the same max_tokens tends to truncate at the same
+            # spot again (observed with "noise": 4/4 identical truncated
+            # attempts at 600) -- only a bigger budget actually helps.
+            "max_tokens": 600 + (attempt - 1) * 500,
+        }
         try:
-            resp = requests.post(
-                f"{BASE_URL}/chat/completions", headers=headers, json=payload, timeout=60
+            # (connect_timeout, read_timeout): fail fast on a stuck/dead
+            # connection instead of blocking for a full minute per attempt.
+            resp = session.post(
+                f"{BASE_URL}/chat/completions", headers=headers, json=payload, timeout=(10, 45)
             )
         except requests.exceptions.RequestException as exc:
             if attempt == max_retries:
                 raise RuntimeError(f"Network error calling Dahl API: {exc}") from exc
+            print(f"    [retry {attempt}/{max_retries}] network error ({exc}); retrying in {delay:.0f}s...")
             time.sleep(delay)
             delay *= 2
             continue
@@ -193,7 +316,26 @@ def call_dahl_chat(api_key: str, model: str, text: str, max_retries: int = 4) ->
         if resp.status_code == 200:
             data = resp.json()
             content = data["choices"][0]["message"]["content"]
-            return clean_translation(content)
+            usage = data.get("usage") or {}
+
+            # A response cut off mid-<think> (no closing tag) never
+            # reached the actual translation; retry rather than saving
+            # a blank/garbage field.
+            truncated_mid_think = "<think>" in content.lower() and "</think>" not in content.lower()
+            cleaned = clean_translation(content)
+
+            if not truncated_mid_think and cleaned:
+                return cleaned, usage
+
+            if attempt == max_retries:
+                raise RuntimeError(
+                    f"Dahl API kept returning an empty/truncated translation after {max_retries} "
+                    f"attempts (raw content: {content!r})"
+                )
+            print(f"    [retry {attempt}/{max_retries}] empty/truncated response; retrying in {delay:.0f}s...")
+            time.sleep(delay)
+            delay *= 2
+            continue
 
         if resp.status_code == 401:
             raise RuntimeError(
@@ -210,6 +352,7 @@ def call_dahl_chat(api_key: str, model: str, text: str, max_retries: int = 4) ->
         if resp.status_code == 429 or resp.status_code == 503 or resp.status_code >= 500:
             if attempt == max_retries:
                 raise RuntimeError(f"Dahl API error {resp.status_code} after {max_retries} retries: {resp.text}")
+            print(f"    [retry {attempt}/{max_retries}] HTTP {resp.status_code}; retrying in {delay:.0f}s...")
             time.sleep(delay)
             delay *= 2
             continue
@@ -228,101 +371,160 @@ def translate_deck(
     overwrite: bool = False,
     limit: int | None = None,
     sleep_between: float = 0.0,
+    proxy: str | None = DEFAULT_PROXY,
 ):
     apkg_path = Path(apkg_path)
     output_path = Path(output_path)
+    session = make_session(proxy)
 
-    check_model_available(model)
+    check_model_available(session, model)
+
+    # Resume from a previous partial run if --output already exists: it
+    # already has this run's translations saved (translate_deck commits
+    # and repackages periodically/on failure), so re-extracting from
+    # --input every time would silently re-translate (and re-bill) every
+    # note done so far. --input is only the starting point for the very
+    # first run.
+    source_path = output_path if output_path.exists() else apkg_path
+    if source_path == output_path:
+        print(f"Resuming from existing output: {output_path}")
 
     with tempfile.TemporaryDirectory() as tmp:
         work_dir = Path(tmp)
-        db_path = extract_apkg(apkg_path, work_dir)
+        with zipfile.ZipFile(source_path, "r") as z:
+            z.extractall(work_dir)
 
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
+        kind, db_path = load_collection(work_dir)
+        print(f"Using collection format: {kind}")
 
-        models = get_models(conn)
-
-        # For every model that has both Meaning/Example and
-        # FaMeaning/FaExample, compute the field indices
-        model_field_idx = {}
-        for mid, info in models.items():
-            flds = info["flds"]
-            needed = [SRC_MEANING, SRC_EXAMPLE, DST_MEANING, DST_EXAMPLE]
-            if all(f in flds for f in needed):
-                model_field_idx[mid] = {f: flds.index(f) for f in needed}
-
-        if not model_field_idx:
-            print("No note type found with Meaning/Example/FaMeaning/FaExample fields.")
-            print("Fields found in existing models:")
-            for info in models.values():
-                print(f"  - {info['name']}: {info['flds']}")
-            conn.close()
-            return
-
-        cur.execute("SELECT id, mid, flds FROM notes")
-        notes = cur.fetchall()
-
+        conn = connect(db_path)
         translated_count = 0
         skipped_count = 0
-        processed = 0
+        has_matching_notetype = False
+        error = None
+        tokens = {"prompt": 0, "completion": 0, "total": 0}
 
-        for note_id, mid, flds_str in notes:
-            mid_str = str(mid)
-            if mid_str not in model_field_idx:
-                continue
+        try:
+            cur = conn.cursor()
+            models = get_models(conn, kind)
 
-            if limit is not None and processed >= limit:
-                break
+            # For every model that has both Meaning/Example and
+            # FaMeaning/FaExample, compute the field indices
+            model_field_idx = {}
+            for mid, info in models.items():
+                flds = info["flds"]
+                needed = [SRC_MEANING, SRC_EXAMPLE, DST_MEANING, DST_EXAMPLE]
+                if all(f in flds for f in needed):
+                    field_idx = {f: flds.index(f) for f in needed}
+                    field_idx["Word"] = flds.index("Word") if "Word" in flds else None
+                    model_field_idx[mid] = field_idx
 
-            idx = model_field_idx[mid_str]
-            fields = flds_str.split(FIELD_SEP)
+            if not model_field_idx:
+                print("No note type found with Meaning/Example/FaMeaning/FaExample fields.")
+                print("Fields found in existing models:")
+                for info in models.values():
+                    print(f"  - {info['name']}: {info['flds']}")
+                return
 
-            meaning = fields[idx[SRC_MEANING]].strip()
-            example = fields[idx[SRC_EXAMPLE]].strip()
-            fa_meaning = fields[idx[DST_MEANING]].strip()
-            fa_example = fields[idx[DST_EXAMPLE]].strip()
+            has_matching_notetype = True
+            cur.execute("SELECT id, mid, flds FROM notes")
+            notes = cur.fetchall()
 
-            changed = False
+            total_candidates = sum(1 for _, mid, _ in notes if str(mid) in model_field_idx)
+            total_to_process = min(limit, total_candidates) if limit is not None else total_candidates
+            print(f"{total_candidates} notes need translating; processing {total_to_process}.")
 
-            if meaning and (overwrite or not fa_meaning):
-                fields[idx[DST_MEANING]] = call_dahl_chat(api_key, model, meaning)
-                changed = True
-                if sleep_between:
-                    time.sleep(sleep_between)
+            def add_usage(usage: dict) -> int:
+                p, c, t = usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0), usage.get("total_tokens", 0)
+                tokens["prompt"] += p
+                tokens["completion"] += c
+                tokens["total"] += t
+                return t
 
-            if example and (overwrite or not fa_example):
-                fields[idx[DST_EXAMPLE]] = call_dahl_chat(api_key, model, example)
-                changed = True
-                if sleep_between:
-                    time.sleep(sleep_between)
+            processed = 0
 
-            if changed:
-                new_flds = FIELD_SEP.join(fields)
-                cur.execute("UPDATE notes SET flds = ? WHERE id = ?", (new_flds, note_id))
-                translated_count += 1
-            else:
-                skipped_count += 1
+            for note_id, mid, flds_str in notes:
+                mid_str = str(mid)
+                if mid_str not in model_field_idx:
+                    continue
 
-            processed += 1
-            if processed % 25 == 0:
-                print(f"  ... {processed} cards processed")
+                if limit is not None and processed >= limit:
+                    break
 
-        conn.commit()
-        conn.close()
+                idx = model_field_idx[mid_str]
+                fields = flds_str.split(FIELD_SEP)
+                word = fields[idx["Word"]].strip() if idx["Word"] is not None else f"note {note_id}"
+
+                meaning = fields[idx[SRC_MEANING]].strip()
+                example = fields[idx[SRC_EXAMPLE]].strip()
+                fa_meaning = fields[idx[DST_MEANING]].strip()
+                fa_example = fields[idx[DST_EXAMPLE]].strip()
+
+                changed = False
+                note_tokens = 0
+                progress = f"[{processed + 1}/{total_to_process}] ({(processed + 1) / total_to_process:.1%}) {word}"
+
+                if meaning and (overwrite or not fa_meaning):
+                    translated, usage = call_dahl_chat(session, api_key, model, meaning)
+                    fields[idx[DST_MEANING]] = translated
+                    changed = True
+                    note_tokens += add_usage(usage)
+                    print(f"{progress} | FaMeaning: {translated}")
+                    if sleep_between:
+                        time.sleep(sleep_between)
+
+                if example and (overwrite or not fa_example):
+                    translated, usage = call_dahl_chat(session, api_key, model, example)
+                    fields[idx[DST_EXAMPLE]] = translated
+                    changed = True
+                    note_tokens += add_usage(usage)
+                    print(f"{progress} | FaExample: {translated}")
+                    if sleep_between:
+                        time.sleep(sleep_between)
+
+                if changed:
+                    new_flds = FIELD_SEP.join(fields)
+                    # Anki's importer matches notes by GUID but only overwrites
+                    # an existing note's fields if the incoming `mod` is newer
+                    # than the local note's `mod`; leaving `mod` untouched would
+                    # make this update a silent no-op on a collection that
+                    # already has these notes. usn=-1 is Anki's own "modified
+                    # locally, needs sync" marker for edited notes.
+                    cur.execute(
+                        "UPDATE notes SET flds=?, mod=?, usn=-1 WHERE id=?",
+                        (new_flds, int(time.time()), note_id),
+                    )
+                    translated_count += 1
+                    print(f"{progress} | tokens: +{note_tokens} (cumulative: {tokens['total']})")
+                else:
+                    skipped_count += 1
+
+                processed += 1
+                if processed % 25 == 0:
+                    # Commit periodically so a failure later in the run (bad
+                    # key, exhausted quota, network drop) doesn't roll back
+                    # translations already paid for/done in this run.
+                    conn.commit()
+                    print(
+                        f"  ... {processed}/{total_to_process} processed (progress saved) | "
+                        f"tokens so far: prompt={tokens['prompt']} completion={tokens['completion']} total={tokens['total']}"
+                    )
+        except Exception as exc:
+            error = exc
+        finally:
+            conn.commit()
+            conn.close()
 
         print(f"Done: {translated_count} cards translated, {skipped_count} cards skipped (already filled).")
+        print(f"Total tokens used: prompt={tokens['prompt']} completion={tokens['completion']} total={tokens['total']}")
 
-        # Repackage the work_dir back into an apkg (zip) file
-        if output_path.exists():
-            output_path.unlink()
+        if has_matching_notetype:
+            # Repackage even if the loop above raised partway through, so
+            # whatever was translated before the failure isn't lost.
+            repackage(work_dir, kind, db_path, output_path)
 
-        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for item in work_dir.rglob("*"):
-                if item.is_file():
-                    zf.write(item, item.relative_to(work_dir))
-
-        print(f"Output file saved: {output_path}")
+        if error is not None:
+            raise error
 
 
 def main():
@@ -338,6 +540,8 @@ def main():
     parser.add_argument("--overwrite", action="store_true", help="Re-translate even if a translation already exists")
     parser.add_argument("--limit", type=int, default=None, help="Only process the first N cards (for testing)")
     parser.add_argument("--sleep", type=float, default=0.0, help="Delay between requests, in seconds")
+    parser.add_argument("--proxy", default=DEFAULT_PROXY, help=f"HTTP(S) proxy for Dahl requests (default: {DEFAULT_PROXY})")
+    parser.add_argument("--no-proxy", action="store_true", help="Disable the proxy and connect directly")
     args = parser.parse_args()
 
     if not args.api_key:
@@ -353,6 +557,7 @@ def main():
         overwrite=args.overwrite,
         limit=args.limit,
         sleep_between=args.sleep,
+        proxy=None if args.no_proxy else args.proxy,
     )
 
 
