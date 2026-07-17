@@ -30,9 +30,13 @@ environment variable. Get a key with no signup at:
 or:
     curl -X POST https://inference.dahl.global/tokens
 
-Requests are routed through --proxy (default http://127.0.0.1:10808, the
-same local proxy the Downloder scripts use) since this network cannot
-reach external hosts directly. Pass --no-proxy to disable it.
+Each request tries a direct connection first, then --proxy (default
+http://127.0.0.1:10808, the same local proxy the Downloder scripts use)
+if direct fails, alternating back and forth on further retries -- whichever
+one is actually up varies over time, so retrying is more resilient than
+committing to just one. Pass --no-proxy to skip the proxy entirely and
+only ever try direct. The wait between retries grows following the
+Fibonacci sequence (1, 2, 3, 5, 8, ... seconds).
 
 Like add_hints_to_shared_deck.py, this edits the collection in place:
 note ids/GUIDs are untouched (only FaMeaning/FaExample + mod/usn change),
@@ -217,19 +221,50 @@ def make_session(proxy: str | None) -> requests.Session:
     return session
 
 
-def check_model_available(session: requests.Session, model_id: str) -> None:
+def fib_delay(attempt: int) -> float:
+    """Delay before the (attempt+1)-th try: 1, 2, 3, 5, 8, 13, ..."""
+    a, b = 1, 2
+    for _ in range(attempt - 1):
+        a, b = b, a + b
+    return float(a)
+
+
+def pick_session(attempt: int, session_direct: requests.Session, session_proxied: requests.Session | None):
+    """
+    Alternate connection modes across attempts: try direct first, then the
+    proxy, then back to direct, and so on -- either one might be the one
+    that's actually working at a given moment. Falls back to direct-only
+    if no proxy session was configured (--no-proxy).
+    """
+    if session_proxied is None:
+        return session_direct, "direct"
+    if attempt % 2 == 1:
+        return session_direct, "direct"
+    return session_proxied, "proxy"
+
+
+def check_model_available(session_direct: requests.Session, session_proxied: requests.Session | None, model_id: str) -> None:
     """
     Query GET /v1/models (public, no auth) and warn if the requested
     model id is not currently listed. Does not raise -- Dahl's own
     docs note that ids can rotate, so this check is advisory only.
+    Tries direct first, then the proxy, since either may be the one
+    actually reaching the internet right now.
     """
-    try:
-        resp = session.get(f"{BASE_URL}/models", timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        available_ids = [m.get("id") for m in data.get("data", [])]
-    except Exception as exc:
-        print(f"Warning: could not verify model availability ({exc}). Continuing anyway.")
+    last_exc = None
+    for session, mode in [(session_direct, "direct"), (session_proxied, "proxy")]:
+        if session is None:
+            continue
+        try:
+            resp = session.get(f"{BASE_URL}/models", timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            available_ids = [m.get("id") for m in data.get("data", [])]
+            break
+        except Exception as exc:
+            last_exc = exc
+    else:
+        print(f"Warning: could not verify model availability ({last_exc}). Continuing anyway.")
         return
 
     if available_ids and model_id not in available_ids:
@@ -263,14 +298,26 @@ def clean_translation(text: str) -> str:
     return text
 
 
-def call_dahl_chat(session: requests.Session, api_key: str, model: str, text: str, max_retries: int = 4) -> tuple[str, dict]:
+def call_dahl_chat(
+    session_direct: requests.Session,
+    session_proxied: requests.Session | None,
+    api_key: str,
+    model: str,
+    text: str,
+    max_retries: int = 6,
+) -> tuple[str, dict]:
     """
     Send a single chat completion request to Dahl asking for a Persian
     translation of `text`, and return (cleaned_translation, usage) where
     usage is the API's token-count dict ({"prompt_tokens", "completion_tokens",
     "total_tokens"}, empty if the API didn't report it).
-    Retries with short exponential backoff on 429/503/5xx, per Dahl's
-    own documented guidance for handling network/node overload.
+
+    Each retry alternates between a direct connection and the proxy
+    (pick_session) -- whichever is actually up varies over time, so
+    sticking to one exclusively can fail for a long stretch while the
+    other would have worked. The wait between attempts grows following
+    the Fibonacci sequence (1, 2, 3, 5, 8, ... seconds) rather than
+    doubling, per Dahl's guidance for handling network/node overload.
     """
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -282,8 +329,8 @@ def call_dahl_chat(session: requests.Session, api_key: str, model: str, text: st
         # than a clean, retryable error.
         "Connection": "close",
     }
-    delay = 2.0
     for attempt in range(1, max_retries + 1):
+        session, mode = pick_session(attempt, session_direct, session_proxied)
         payload = {
             "model": model,
             "messages": [
@@ -308,9 +355,11 @@ def call_dahl_chat(session: requests.Session, api_key: str, model: str, text: st
         except requests.exceptions.RequestException as exc:
             if attempt == max_retries:
                 raise RuntimeError(f"Network error calling Dahl API: {exc}") from exc
-            print(f"    [retry {attempt}/{max_retries}] network error ({exc}); retrying in {delay:.0f}s...")
+            delay = fib_delay(attempt)
+            next_session, next_mode = pick_session(attempt + 1, session_direct, session_proxied)
+            print(f"    [retry {attempt}/{max_retries}] {mode} network error ({exc}); "
+                  f"retrying via {next_mode} in {delay:.0f}s...")
             time.sleep(delay)
-            delay *= 2
             continue
 
         if resp.status_code == 200:
@@ -332,9 +381,9 @@ def call_dahl_chat(session: requests.Session, api_key: str, model: str, text: st
                     f"Dahl API kept returning an empty/truncated translation after {max_retries} "
                     f"attempts (raw content: {content!r})"
                 )
+            delay = fib_delay(attempt)
             print(f"    [retry {attempt}/{max_retries}] empty/truncated response; retrying in {delay:.0f}s...")
             time.sleep(delay)
-            delay *= 2
             continue
 
         if resp.status_code == 401:
@@ -352,9 +401,9 @@ def call_dahl_chat(session: requests.Session, api_key: str, model: str, text: st
         if resp.status_code == 429 or resp.status_code == 503 or resp.status_code >= 500:
             if attempt == max_retries:
                 raise RuntimeError(f"Dahl API error {resp.status_code} after {max_retries} retries: {resp.text}")
+            delay = fib_delay(attempt)
             print(f"    [retry {attempt}/{max_retries}] HTTP {resp.status_code}; retrying in {delay:.0f}s...")
             time.sleep(delay)
-            delay *= 2
             continue
 
         # Other 4xx errors, e.g. a stale/unsupported model id
@@ -375,9 +424,10 @@ def translate_deck(
 ):
     apkg_path = Path(apkg_path)
     output_path = Path(output_path)
-    session = make_session(proxy)
+    session_direct = make_session(None)
+    session_proxied = make_session(proxy) if proxy else None
 
-    check_model_available(session, model)
+    check_model_available(session_direct, session_proxied, model)
 
     # Resume from a previous partial run if --output already exists: it
     # already has this run's translations saved (translate_deck commits
@@ -465,7 +515,7 @@ def translate_deck(
                 progress = f"[{processed + 1}/{total_to_process}] ({(processed + 1) / total_to_process:.1%}) {word}"
 
                 if meaning and (overwrite or not fa_meaning):
-                    translated, usage = call_dahl_chat(session, api_key, model, meaning)
+                    translated, usage = call_dahl_chat(session_direct, session_proxied, api_key, model, meaning)
                     fields[idx[DST_MEANING]] = translated
                     changed = True
                     note_tokens += add_usage(usage)
@@ -474,7 +524,7 @@ def translate_deck(
                         time.sleep(sleep_between)
 
                 if example and (overwrite or not fa_example):
-                    translated, usage = call_dahl_chat(session, api_key, model, example)
+                    translated, usage = call_dahl_chat(session_direct, session_proxied, api_key, model, example)
                     fields[idx[DST_EXAMPLE]] = translated
                     changed = True
                     note_tokens += add_usage(usage)
