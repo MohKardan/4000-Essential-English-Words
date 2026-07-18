@@ -71,10 +71,12 @@ Notes:
 import argparse
 import json
 import os
+import queue
 import re
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -218,6 +220,19 @@ def make_session(proxy: str | None) -> requests.Session:
     session = requests.Session()
     if proxy:
         session.proxies.update({"http": proxy, "https": proxy})
+    # requests' default User-Agent ("python-requests/x.y") is a well-known
+    # bot signature; Cloudflare's bot-management sits in front of Dahl and
+    # was observed returning a JS challenge page (403) for it. A normal
+    # browser-like header set is standard practice for API clients and
+    # avoids being mis-flagged as a scraper for a legitimate API key.
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
     return session
 
 
@@ -298,6 +313,40 @@ def clean_translation(text: str) -> str:
     return text
 
 
+def post_with_hard_timeout(session: requests.Session, url: str, headers: dict, payload: dict,
+                           soft_timeout: tuple, hard_timeout: float) -> requests.Response:
+    """
+    requests' own (connect, read) timeout was observed to not always fire --
+    a request through the local proxy once hung for hours with an
+    established TCP connection and no error, well past its 45s read
+    timeout. Running the call in a daemon thread and giving up after
+    hard_timeout wall-clock seconds guarantees the caller always gets
+    control back, even if the underlying socket call never returns. The
+    orphaned thread is left to die on its own (or leak harmlessly for the
+    life of the process); it cannot be forcibly killed from here.
+    """
+    result: queue.Queue = queue.Queue(maxsize=1)
+
+    def worker():
+        try:
+            resp = session.post(url, headers=headers, json=payload, timeout=soft_timeout)
+            result.put(("ok", resp))
+        except Exception as exc:
+            result.put(("error", exc))
+
+    threading.Thread(target=worker, daemon=True).start()
+    try:
+        kind, value = result.get(timeout=hard_timeout)
+    except queue.Empty:
+        raise TimeoutError(
+            f"Request hard-timed out after {hard_timeout:.0f}s (the underlying "
+            f"{soft_timeout} connect/read timeout never fired)"
+        )
+    if kind == "error":
+        raise value
+    return value
+
+
 def call_dahl_chat(
     session_direct: requests.Session,
     session_proxied: requests.Session | None,
@@ -349,10 +398,14 @@ def call_dahl_chat(
         try:
             # (connect_timeout, read_timeout): fail fast on a stuck/dead
             # connection instead of blocking for a full minute per attempt.
-            resp = session.post(
-                f"{BASE_URL}/chat/completions", headers=headers, json=payload, timeout=(10, 45)
+            # Wrapped in a hard wall-clock timeout because this soft timeout
+            # was observed to not fire at all on one occasion (a request
+            # hung for hours with an established connection and no error).
+            resp = post_with_hard_timeout(
+                session, f"{BASE_URL}/chat/completions", headers, payload,
+                soft_timeout=(10, 45), hard_timeout=90,
             )
-        except requests.exceptions.RequestException as exc:
+        except (requests.exceptions.RequestException, TimeoutError) as exc:
             if attempt == max_retries:
                 raise RuntimeError(f"Network error calling Dahl API: {exc}") from exc
             delay = fib_delay(attempt)
@@ -364,25 +417,47 @@ def call_dahl_chat(
 
         if resp.status_code == 200:
             data = resp.json()
-            content = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
             usage = data.get("usage") or {}
 
             # A response cut off mid-<think> (no closing tag) never
             # reached the actual translation; retry rather than saving
             # a blank/garbage field.
             truncated_mid_think = "<think>" in content.lower() and "</think>" not in content.lower()
+
+            # The API's own signal that max_tokens was hit before the model
+            # finished -- catches the case that truncated_mid_think misses:
+            # </think> closed fine, but the real answer after it got cut off
+            # mid-sentence/mid-word (observed: "من بذر را در خاک کاش" instead
+            # of "کاشتم", "...و چ" instead of a finished word).
+            #
+            # Deliberately NOT also checking for trailing punctuation as a
+            # heuristic: many complete, correct short Persian sentences don't
+            # end in a period (e.g. "او یک میزبان مهربان بود"), so that check
+            # rejected valid translations on every retry and burned through
+            # max_retries on a sentence that was fine from the first attempt.
+            truncated_by_length = choice.get("finish_reason") == "length"
+
             cleaned = clean_translation(content)
 
-            if not truncated_mid_think and cleaned:
+            if not truncated_mid_think and not truncated_by_length and cleaned:
                 return cleaned, usage
+
+            if truncated_mid_think:
+                reason = "cut off mid-<think>"
+            elif truncated_by_length:
+                reason = "cut off by max_tokens (finish_reason=length)"
+            else:
+                reason = "empty response"
 
             if attempt == max_retries:
                 raise RuntimeError(
-                    f"Dahl API kept returning an empty/truncated translation after {max_retries} "
-                    f"attempts (raw content: {content!r})"
+                    f"Dahl API kept returning a truncated translation after {max_retries} "
+                    f"attempts ({reason}; raw content: {content!r})"
                 )
             delay = fib_delay(attempt)
-            print(f"    [retry {attempt}/{max_retries}] empty/truncated response; retrying in {delay:.0f}s...")
+            print(f"    [retry {attempt}/{max_retries}] {reason}; retrying in {delay:.0f}s...")
             time.sleep(delay)
             continue
 
@@ -398,11 +473,27 @@ def call_dahl_chat(
                 "Create a new key at https://inference.dahl.global/#models"
             )
 
-        if resp.status_code == 429 or resp.status_code == 503 or resp.status_code >= 500:
+        # 403 is included here because it isn't always Dahl itself: a burst of
+        # requests from one IP can trip Cloudflare's bot-challenge page (a
+        # "Just a moment..." JS challenge) in front of the API, which a
+        # plain HTTP client can never pass. Retrying alone won't fix that,
+        # but alternating to the other connection mode (direct vs proxy)
+        # presents a different IP, which often does get past it.
+        if resp.status_code == 403 or resp.status_code == 429 or resp.status_code == 503 or resp.status_code >= 500:
             if attempt == max_retries:
+                if resp.status_code == 403 and "cf_chl" in resp.text:
+                    raise RuntimeError(
+                        f"Dahl API kept returning a Cloudflare bot challenge (403) after {max_retries} "
+                        "attempts via both direct and proxy. This is rate/traffic-based, not something "
+                        "a retry can force past -- wait a few minutes before restarting, and consider "
+                        "raising --sleep to lower the request rate."
+                    )
                 raise RuntimeError(f"Dahl API error {resp.status_code} after {max_retries} retries: {resp.text}")
             delay = fib_delay(attempt)
-            print(f"    [retry {attempt}/{max_retries}] HTTP {resp.status_code}; retrying in {delay:.0f}s...")
+            next_session, next_mode = pick_session(attempt + 1, session_direct, session_proxied)
+            challenge_hint = " (looks like a Cloudflare bot challenge)" if "cf_chl" in resp.text else ""
+            print(f"    [retry {attempt}/{max_retries}] {mode} HTTP {resp.status_code}{challenge_hint}; "
+                  f"retrying via {next_mode} in {delay:.0f}s...")
             time.sleep(delay)
             continue
 
@@ -551,27 +642,38 @@ def translate_deck(
 
                 processed += 1
                 if processed % 25 == 0:
-                    # Commit periodically so a failure later in the run (bad
-                    # key, exhausted quota, network drop) doesn't roll back
-                    # translations already paid for/done in this run.
+                    # Commit AND repackage periodically. Committing alone
+                    # only guarantees the data survives inside the temp
+                    # working copy; repackage() is what actually writes it
+                    # to the real --output file on disk. Without doing both
+                    # here, a hang/crash before the run's single final
+                    # repackage (the old behavior) loses everything back to
+                    # the previous run's checkpoint, however long ago that
+                    # was -- exactly what happened overnight.
                     conn.commit()
+                    repackage(work_dir, kind, db_path, output_path)
                     print(
-                        f"  ... {processed}/{total_to_process} processed (progress saved) | "
+                        f"  ... {processed}/{total_to_process} processed (progress saved to disk) | "
                         f"tokens so far: prompt={tokens['prompt']} completion={tokens['completion']} total={tokens['total']}"
                     )
         except Exception as exc:
             error = exc
         finally:
+            # In `finally` (not after the try/except) so this still runs on
+            # Ctrl+C or any other BaseException that `except Exception`
+            # doesn't catch -- otherwise an interrupt would skip repackage()
+            # entirely and lose everything translated since the last
+            # periodic commit.
             conn.commit()
             conn.close()
 
-        print(f"Done: {translated_count} cards translated, {skipped_count} cards skipped (already filled).")
-        print(f"Total tokens used: prompt={tokens['prompt']} completion={tokens['completion']} total={tokens['total']}")
+            print(f"Done: {translated_count} cards translated, {skipped_count} cards skipped (already filled).")
+            print(f"Total tokens used: prompt={tokens['prompt']} completion={tokens['completion']} total={tokens['total']}")
 
-        if has_matching_notetype:
-            # Repackage even if the loop above raised partway through, so
-            # whatever was translated before the failure isn't lost.
-            repackage(work_dir, kind, db_path, output_path)
+            if has_matching_notetype:
+                # Repackage even if the loop above raised partway through, so
+                # whatever was translated before the failure isn't lost.
+                repackage(work_dir, kind, db_path, output_path)
 
         if error is not None:
             raise error
