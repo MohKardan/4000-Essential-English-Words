@@ -36,7 +36,14 @@ if direct fails, alternating back and forth on further retries -- whichever
 one is actually up varies over time, so retrying is more resilient than
 committing to just one. Pass --no-proxy to skip the proxy entirely and
 only ever try direct. The wait between retries grows following the
-Fibonacci sequence (1, 2, 3, 5, 8, ... seconds).
+Fibonacci sequence (1, 2, 3, 5, 8, ... seconds), capped at MAX_RETRY_DELAY.
+
+This script never gives up and never exits on its own: every failure mode
+(network errors, Cloudflare challenges, truncated output, even a bad/
+expired key or exhausted quota) is retried forever instead of raising, and
+main() wraps the whole run in one more retry loop as a last resort. Kill
+it yourself (Ctrl+C) if you need it to stop; otherwise it keeps polling
+and resumes on its own once whatever was wrong clears up.
 
 Like add_hints_to_shared_deck.py, this edits the collection in place:
 note ids/GUIDs are untouched (only FaMeaning/FaExample + mod/usn change),
@@ -78,6 +85,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import zipfile
 from pathlib import Path
 
@@ -104,6 +112,13 @@ DST_EXAMPLE = "FaExample"
 BASE_URL = "https://inference.dahl.global/v1"
 DEFAULT_MODEL = "MiniMaxAI/MiniMax-M2.7"
 DEFAULT_PROXY = "http://127.0.0.1:10808"
+
+# call_dahl_chat() retries forever rather than ever raising, so both of
+# these need a ceiling: without one, fib_delay grows unboundedly (minutes,
+# then hours, between tries) and the escalating max_tokens budget would
+# eventually balloon into an enormous, expensive request.
+MAX_RETRY_DELAY = 60.0
+MAX_TOKENS_CAP = 4000
 
 SYSTEM_PROMPT = (
     "You are a professional English-to-Persian translator working on "
@@ -291,6 +306,17 @@ def check_model_available(session_direct: requests.Session, session_proxied: req
 THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
+DIV_TAG_RE = re.compile(r"</?div\s*>", re.IGNORECASE)
+# Matches a leading "\u0645\u062b\u0627\u0644:" ("Example:", used in FaExample) or "\u0645\u0639\u0646\u06cc:"
+# ("Meaning:", used in FaMeaning) label, whether or not it's wrapped in
+# <strong> tags, and whether the space after the colon is a real space or
+# an HTML &nbsp; entity (observed both ways).
+LEADING_LABEL_RE = re.compile(
+    r"^\s*(?:<strong>\s*)?(?:\u0645\u062b\u0627\u0644|\u0645\u0639\u0646\u06cc)\s*[:\uff1a]\s*(?:&nbsp;\s*)*(?:</strong>\s*)?"
+)
+STRONG_TAG_RE = re.compile(r"<(/?)strong\s*>", re.IGNORECASE)
+
+
 def clean_translation(text: str) -> str:
     """Strip common wrapping artifacts a chat model may add despite instructions."""
     # All currently available Dahl models are reasoning models: they
@@ -309,6 +335,21 @@ def clean_translation(text: str) -> str:
         if len(text) >= 2 and text.startswith(left) and text.endswith(right):
             text = text[1:-1].strip()
             break
+
+    # Occasionally (observed on a handful of longer/abstract words, in both
+    # FaMeaning and FaExample) the model wraps its answer in stray markup
+    # instead of plain text -- with or without a <div> wrapper, with or
+    # without <strong> tags, sometimes using a literal "&nbsp;" instead of a
+    # space. The div wrapper is pure noise (strip unconditionally); the
+    # leading "\u0645\u062b\u0627\u0644:"/"\u0645\u0639\u0646\u06cc:" label is also noise (strip it specifically,
+    # not every <strong> -- a <strong> around the translated word itself is
+    # real emphasis, same role as <b> elsewhere in this deck, so convert
+    # rather than delete it).
+    if "<div" in text.lower():
+        text = DIV_TAG_RE.sub("", text).strip()
+    text = LEADING_LABEL_RE.sub("", text).strip()
+    if "<strong" in text.lower():
+        text = STRONG_TAG_RE.sub(lambda m: f"<{m.group(1)}b>", text).strip()
 
     return text
 
@@ -353,7 +394,6 @@ def call_dahl_chat(
     api_key: str,
     model: str,
     text: str,
-    max_retries: int = 6,
 ) -> tuple[str, dict]:
     """
     Send a single chat completion request to Dahl asking for a Persian
@@ -361,12 +401,22 @@ def call_dahl_chat(
     usage is the API's token-count dict ({"prompt_tokens", "completion_tokens",
     "total_tokens"}, empty if the API didn't report it).
 
+    Retries forever and never raises: no matter what goes wrong (network
+    outage, Cloudflare challenge, truncated output, even a bad/expired key
+    or exhausted quota), this keeps trying rather than letting the whole
+    script crash and exit. Every prior crash the script has hit overnight
+    was a transient condition that cleared up on its own (network came
+    back, proxy restarted) -- the fix each time was "restart the script",
+    which this loop now does internally instead of needing a human to
+    notice and re-run it.
+
     Each retry alternates between a direct connection and the proxy
     (pick_session) -- whichever is actually up varies over time, so
     sticking to one exclusively can fail for a long stretch while the
     other would have worked. The wait between attempts grows following
-    the Fibonacci sequence (1, 2, 3, 5, 8, ... seconds) rather than
-    doubling, per Dahl's guidance for handling network/node overload.
+    the Fibonacci sequence (1, 2, 3, 5, 8, ... seconds), capped at
+    MAX_RETRY_DELAY so it settles into a steady polling cadence instead of
+    waiting longer and longer forever.
     """
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -378,7 +428,9 @@ def call_dahl_chat(
         # than a clean, retryable error.
         "Connection": "close",
     }
-    for attempt in range(1, max_retries + 1):
+    attempt = 0
+    while True:
+        attempt += 1
         session, mode = pick_session(attempt, session_direct, session_proxied)
         payload = {
             "model": model,
@@ -393,7 +445,8 @@ def call_dahl_chat(
             # with the same max_tokens tends to truncate at the same
             # spot again (observed with "noise": 4/4 identical truncated
             # attempts at 600) -- only a bigger budget actually helps.
-            "max_tokens": 600 + (attempt - 1) * 500,
+            # Capped since attempt is now unbounded (retries forever).
+            "max_tokens": min(600 + (attempt - 1) * 500, MAX_TOKENS_CAP),
         }
         try:
             # (connect_timeout, read_timeout): fail fast on a stuck/dead
@@ -406,11 +459,9 @@ def call_dahl_chat(
                 soft_timeout=(10, 45), hard_timeout=90,
             )
         except (requests.exceptions.RequestException, TimeoutError) as exc:
-            if attempt == max_retries:
-                raise RuntimeError(f"Network error calling Dahl API: {exc}") from exc
-            delay = fib_delay(attempt)
+            delay = min(fib_delay(attempt), MAX_RETRY_DELAY)
             next_session, next_mode = pick_session(attempt + 1, session_direct, session_proxied)
-            print(f"    [retry {attempt}/{max_retries}] {mode} network error ({exc}); "
+            print(f"    [retry {attempt}] {mode} network error ({exc}); "
                   f"retrying via {next_mode} in {delay:.0f}s...")
             time.sleep(delay)
             continue
@@ -435,8 +486,8 @@ def call_dahl_chat(
             # Deliberately NOT also checking for trailing punctuation as a
             # heuristic: many complete, correct short Persian sentences don't
             # end in a period (e.g. "او یک میزبان مهربان بود"), so that check
-            # rejected valid translations on every retry and burned through
-            # max_retries on a sentence that was fine from the first attempt.
+            # rejected valid translations on every retry, wasting many
+            # retries on a sentence that was fine from the first attempt.
             truncated_by_length = choice.get("finish_reason") == "length"
 
             cleaned = clean_translation(content)
@@ -451,27 +502,32 @@ def call_dahl_chat(
             else:
                 reason = "empty response"
 
-            if attempt == max_retries:
-                raise RuntimeError(
-                    f"Dahl API kept returning a truncated translation after {max_retries} "
-                    f"attempts ({reason}; raw content: {content!r})"
-                )
-            delay = fib_delay(attempt)
-            print(f"    [retry {attempt}/{max_retries}] {reason}; retrying in {delay:.0f}s...")
+            delay = min(fib_delay(attempt), MAX_RETRY_DELAY)
+            print(f"    [retry {attempt}] {reason}; retrying in {delay:.0f}s...")
             time.sleep(delay)
             continue
 
+        # 401/402 are normally permanent (bad key / no quota left) and would
+        # traditionally be a hard stop -- but per policy this function must
+        # never raise, so instead it waits and keeps polling. If the key
+        # truly is dead this spins harmlessly forever (visible in the log,
+        # not silent); if it was a transient false-positive or the account
+        # gets topped up, the run resumes on its own with no restart needed.
         if resp.status_code == 401:
-            raise RuntimeError(
-                "Dahl API returned 401 (missing/invalid/expired token). "
-                "Get a fresh key at https://inference.dahl.global/#models"
-            )
+            delay = min(fib_delay(attempt), MAX_RETRY_DELAY)
+            print(f"    [retry {attempt}] Dahl API returned 401 (missing/invalid/expired token) -- "
+                  f"get a fresh key at https://inference.dahl.global/#models if this persists; "
+                  f"retrying in {delay:.0f}s...")
+            time.sleep(delay)
+            continue
 
         if resp.status_code == 402:
-            raise RuntimeError(
-                "Dahl API returned 402 (available tokens exhausted on this key). "
-                "Create a new key at https://inference.dahl.global/#models"
-            )
+            delay = min(fib_delay(attempt), MAX_RETRY_DELAY)
+            print(f"    [retry {attempt}] Dahl API returned 402 (tokens exhausted on this key) -- "
+                  f"create a new key at https://inference.dahl.global/#models if this persists; "
+                  f"retrying in {delay:.0f}s...")
+            time.sleep(delay)
+            continue
 
         # 403 is included here because it isn't always Dahl itself: a burst of
         # requests from one IP can trip Cloudflare's bot-challenge page (a
@@ -480,27 +536,20 @@ def call_dahl_chat(
         # but alternating to the other connection mode (direct vs proxy)
         # presents a different IP, which often does get past it.
         if resp.status_code == 403 or resp.status_code == 429 or resp.status_code == 503 or resp.status_code >= 500:
-            if attempt == max_retries:
-                if resp.status_code == 403 and "cf_chl" in resp.text:
-                    raise RuntimeError(
-                        f"Dahl API kept returning a Cloudflare bot challenge (403) after {max_retries} "
-                        "attempts via both direct and proxy. This is rate/traffic-based, not something "
-                        "a retry can force past -- wait a few minutes before restarting, and consider "
-                        "raising --sleep to lower the request rate."
-                    )
-                raise RuntimeError(f"Dahl API error {resp.status_code} after {max_retries} retries: {resp.text}")
-            delay = fib_delay(attempt)
+            delay = min(fib_delay(attempt), MAX_RETRY_DELAY)
             next_session, next_mode = pick_session(attempt + 1, session_direct, session_proxied)
             challenge_hint = " (looks like a Cloudflare bot challenge)" if "cf_chl" in resp.text else ""
-            print(f"    [retry {attempt}/{max_retries}] {mode} HTTP {resp.status_code}{challenge_hint}; "
+            print(f"    [retry {attempt}] {mode} HTTP {resp.status_code}{challenge_hint}; "
                   f"retrying via {next_mode} in {delay:.0f}s...")
             time.sleep(delay)
             continue
 
-        # Other 4xx errors, e.g. a stale/unsupported model id
-        raise RuntimeError(f"Dahl API error {resp.status_code}: {resp.text}")
-
-    raise RuntimeError("Exhausted retries calling Dahl API.")
+        # Other 4xx errors, e.g. a stale/unsupported model id. Still never
+        # raise -- keep polling at the capped delay rather than exiting.
+        delay = min(fib_delay(attempt), MAX_RETRY_DELAY)
+        print(f"    [retry {attempt}] Dahl API error {resp.status_code}: {resp.text[:300]!r}; "
+              f"retrying in {delay:.0f}s...")
+        time.sleep(delay)
 
 
 def translate_deck(
@@ -595,50 +644,60 @@ def translate_deck(
                 idx = model_field_idx[mid_str]
                 fields = flds_str.split(FIELD_SEP)
                 word = fields[idx["Word"]].strip() if idx["Word"] is not None else f"note {note_id}"
-
-                meaning = fields[idx[SRC_MEANING]].strip()
-                example = fields[idx[SRC_EXAMPLE]].strip()
-                fa_meaning = fields[idx[DST_MEANING]].strip()
-                fa_example = fields[idx[DST_EXAMPLE]].strip()
-
-                changed = False
-                note_tokens = 0
                 progress = f"[{processed + 1}/{total_to_process}] ({(processed + 1) / total_to_process:.1%}) {word}"
 
-                if meaning and (overwrite or not fa_meaning):
-                    translated, usage = call_dahl_chat(session_direct, session_proxied, api_key, model, meaning)
-                    fields[idx[DST_MEANING]] = translated
-                    changed = True
-                    note_tokens += add_usage(usage)
-                    print(f"{progress} | FaMeaning: {translated}")
-                    if sleep_between:
-                        time.sleep(sleep_between)
+                # call_dahl_chat() itself never raises (it retries forever
+                # internally), so this only guards against something
+                # unrelated to the API -- a bad field, a sqlite error, etc.
+                # Per the "never crash" policy: log it and move on to the
+                # next note rather than aborting the whole run; this note
+                # simply stays untranslated for now and will be picked up
+                # by a future pass over the deck.
+                try:
+                    meaning = fields[idx[SRC_MEANING]].strip()
+                    example = fields[idx[SRC_EXAMPLE]].strip()
+                    fa_meaning = fields[idx[DST_MEANING]].strip()
+                    fa_example = fields[idx[DST_EXAMPLE]].strip()
 
-                if example and (overwrite or not fa_example):
-                    translated, usage = call_dahl_chat(session_direct, session_proxied, api_key, model, example)
-                    fields[idx[DST_EXAMPLE]] = translated
-                    changed = True
-                    note_tokens += add_usage(usage)
-                    print(f"{progress} | FaExample: {translated}")
-                    if sleep_between:
-                        time.sleep(sleep_between)
+                    changed = False
+                    note_tokens = 0
 
-                if changed:
-                    new_flds = FIELD_SEP.join(fields)
-                    # Anki's importer matches notes by GUID but only overwrites
-                    # an existing note's fields if the incoming `mod` is newer
-                    # than the local note's `mod`; leaving `mod` untouched would
-                    # make this update a silent no-op on a collection that
-                    # already has these notes. usn=-1 is Anki's own "modified
-                    # locally, needs sync" marker for edited notes.
-                    cur.execute(
-                        "UPDATE notes SET flds=?, mod=?, usn=-1 WHERE id=?",
-                        (new_flds, int(time.time()), note_id),
-                    )
-                    translated_count += 1
-                    print(f"{progress} | tokens: +{note_tokens} (cumulative: {tokens['total']})")
-                else:
-                    skipped_count += 1
+                    if meaning and (overwrite or not fa_meaning):
+                        translated, usage = call_dahl_chat(session_direct, session_proxied, api_key, model, meaning)
+                        fields[idx[DST_MEANING]] = translated
+                        changed = True
+                        note_tokens += add_usage(usage)
+                        print(f"{progress} | FaMeaning: {translated}")
+                        if sleep_between:
+                            time.sleep(sleep_between)
+
+                    if example and (overwrite or not fa_example):
+                        translated, usage = call_dahl_chat(session_direct, session_proxied, api_key, model, example)
+                        fields[idx[DST_EXAMPLE]] = translated
+                        changed = True
+                        note_tokens += add_usage(usage)
+                        print(f"{progress} | FaExample: {translated}")
+                        if sleep_between:
+                            time.sleep(sleep_between)
+
+                    if changed:
+                        new_flds = FIELD_SEP.join(fields)
+                        # Anki's importer matches notes by GUID but only overwrites
+                        # an existing note's fields if the incoming `mod` is newer
+                        # than the local note's `mod`; leaving `mod` untouched would
+                        # make this update a silent no-op on a collection that
+                        # already has these notes. usn=-1 is Anki's own "modified
+                        # locally, needs sync" marker for edited notes.
+                        cur.execute(
+                            "UPDATE notes SET flds=?, mod=?, usn=-1 WHERE id=?",
+                            (new_flds, int(time.time()), note_id),
+                        )
+                        translated_count += 1
+                        print(f"{progress} | tokens: +{note_tokens} (cumulative: {tokens['total']})")
+                    else:
+                        skipped_count += 1
+                except Exception as exc:
+                    print(f"{progress} | SKIPPING due to unexpected error: {exc!r}")
 
                 processed += 1
                 if processed % 25 == 0:
@@ -701,16 +760,32 @@ def main():
         print("Get one with no signup at: https://inference.dahl.global/#models")
         sys.exit(1)
 
-    translate_deck(
-        apkg_path=args.input,
-        output_path=args.output,
-        api_key=args.api_key,
-        model=args.model,
-        overwrite=args.overwrite,
-        limit=args.limit,
-        sleep_between=args.sleep,
-        proxy=None if args.no_proxy else args.proxy,
-    )
+    # Last-resort safety net: call_dahl_chat() never raises (it retries
+    # forever internally) and per-note errors inside translate_deck() are
+    # caught and skipped rather than propagated, so in practice this loop
+    # shouldn't ever see an exception. It exists anyway because the policy
+    # is that this script must never crash/exit no matter what -- if
+    # translate_deck() does somehow raise (e.g. a setup error before the
+    # per-note loop starts), log it and just call it again instead of
+    # letting the process die; it resumes from --output on disk either way.
+    while True:
+        try:
+            translate_deck(
+                apkg_path=args.input,
+                output_path=args.output,
+                api_key=args.api_key,
+                model=args.model,
+                overwrite=args.overwrite,
+                limit=args.limit,
+                sleep_between=args.sleep,
+                proxy=None if args.no_proxy else args.proxy,
+            )
+            break
+        except Exception:
+            print("translate_deck() raised unexpectedly -- NOT exiting. "
+                  "Waiting 30s and resuming from the on-disk output file...")
+            traceback.print_exc()
+            time.sleep(30)
 
 
 if __name__ == "__main__":
