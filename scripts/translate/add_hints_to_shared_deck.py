@@ -16,16 +16,16 @@ Requirements:
     pip install zstandard bs4 spacy stanza --break-system-packages
     python -m spacy download en_core_web_lg
 
-Usage:
-    python add_hints_to_shared_deck.py \
-        --input "1104981491/4000 Essential English Words (all books).apkg" \
-        --output "1104981491/4000 Essential English Words (all books).hints.apkg" \
-        --data-dir "output/2nd-edition" \
+Usage (run from the repo root):
+    python scripts/translate/add_hints_to_shared_deck.py \
+        --input "dist/shared-deck/4000 Essential English Words (all books).apkg" \
+        --output "dist/shared-deck/4000 Essential English Words (all books).hints.apkg" \
+        --data-dir "data/2nd-edition" \
         --overwrite   # (optional) replace non-empty Hint fields too
 
 Each note is matched to its book via the deck it belongs to (decks are named
 "...::1.Book" .. "...::6.Book"), and its Hint is looked up in that book's
-own word -> hint map (built from output/2nd-edition/bookN/data.json). This
+own word -> hint map (built from data/2nd-edition/bookN/data.json). This
 also works unchanged for a single-book apkg (e.g. only book1's deck/data
 present): every note simply resolves to book 1.
 """
@@ -46,6 +46,9 @@ except ImportError:
     print("The 'zstandard' package is not installed. Run: pip install zstandard --break-system-packages")
     sys.exit(1)
 
+# anki_generator.py lives in a sibling directory (scripts/generate/), not on
+# sys.path by default -- add it explicitly rather than relying on cwd.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "generate"))
 from anki_generator import find_sentence_with_word_spaCy, nlp_spaCy, clean_text
 
 FIELD_SEP = "\x1f"
@@ -191,7 +194,7 @@ def build_hint_map(data_json_path: Path) -> dict:
 
 
 def discover_book_data_jsons(data_dir: Path) -> dict:
-    """Returns {book_number: data.json path} for every output/2nd-edition/bookN/ found."""
+    """Returns {book_number: data.json path} for every data/2nd-edition/bookN/ found."""
     books = {}
     for path in sorted(data_dir.glob("book*/data.json")):
         m = re.match(r"book(\d+)$", path.parent.name)
@@ -391,7 +394,7 @@ def main():
     parser.add_argument("--input", required=True, help="Path to the source apkg")
     parser.add_argument("--output", required=True, help="Path to write the updated apkg")
     parser.add_argument("--data-dir", required=True,
-                         help="Directory containing book1/data.json .. book6/data.json (e.g. output/2nd-edition)")
+                         help="Directory containing book1/data.json .. book6/data.json (e.g. data/2nd-edition)")
     parser.add_argument("--notetype", default=NOTETYPE_NAME, help="Note type name to update (default: '4000 EEW')")
     parser.add_argument("--overwrite", action="store_true", help="Replace non-empty Hint fields too")
     args = parser.parse_args()

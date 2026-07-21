@@ -14,10 +14,10 @@ restrictions).
 Requirements:
     pip install requests --break-system-packages
 
-Usage:
-    python translate_deck_dahl.py \
-        --input "4000_Essential_Words.apkg" \
-        --output "4000_Essential_Words_fa.apkg" \
+Usage (run from the repo root):
+    python scripts/translate/translate_deck_dahl.py \
+        --input "dist/shared-deck/4000 Essential English Words (all books).apkg" \
+        --output "dist/shared-deck/4000 Essential English Words (all books).fa.apkg" \
         --api-key "YOUR_DAHL_API_KEY" \
         --model "MiniMaxAI/MiniMax-M2.7" \
         --overwrite \

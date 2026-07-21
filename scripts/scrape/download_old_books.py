@@ -10,7 +10,7 @@ BOOK_IDS = range(1, 7)
 
 BASE = "https://www.essentialenglish.review/apps-data"
 
-OUTPUT_DIR = Path("output")
+OUTPUT_DIR = Path("data/old-books")
 
 proxies = {
     "http": PROXY,

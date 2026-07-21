@@ -17,7 +17,7 @@ SITE = "https://www.essentialenglish.review"
 
 BOOK_IDS = range(1, 7)
 
-OUTPUT_DIR = Path("output/2nd-edition")
+OUTPUT_DIR = Path("data/2nd-edition")
 
 SLEEP_BETWEEN_UNITS = 1
 

@@ -238,7 +238,7 @@ def create_deck(book_id):
 
     print(f"--Book: {book_id}")
 
-    book_folder = f"output/book{book_id}"
+    book_folder = f"data/old-books/book{book_id}"
 
     # Hierarchical deck naming: Parent::Child
     deck_name = f"4000 EEW (Old Books)::Book {book_id}"
@@ -310,7 +310,7 @@ def create_deck(book_id):
         #break
     package = genanki.Package(deck)
     package.media_files = media_files
-    output_file = f"output/4000EEW_Old_Book_{book_id}.apkg"
+    output_file = f"dist/old-books/4000EEW_Old_Book_{book_id}.apkg"
     package.write_to_file(output_file)
     print(f"Generated: {output_file}")
     
