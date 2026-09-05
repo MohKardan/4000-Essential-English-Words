@@ -25,6 +25,9 @@ Pre-built `.apkg` decks are published on the [Releases](../../releases) page —
 
 ### 4000 EEW (2nd Edition)
 
+AnkiWeb Shared Decks **(easy to use)**:
+[All Books](https://ankiweb.net/shared/info/1813442257)
+
 Built on top of the shared **"4000 Essential English Words"** AnkiWeb deck ([ankiweb.net/shared/info/1104981491](https://ankiweb.net/shared/info/1104981491), based on the book by Paul Nation, Compass Publishing), with two additions:
 - **Hint** — a contextual example sentence for each word, extracted from the official 2nd Edition reading passages
 - **FaMeaning / FaExample** — Persian (Farsi) translations of the Meaning and Example fields, shown as a collapsible "فا" toggle
@@ -36,6 +39,14 @@ Built on top of the shared **"4000 Essential English Words"** AnkiWeb deck ([ank
 | ![2nd Edition – front](docs/2nd-edition-front.png) | ![2nd Edition – back](docs/2nd-edition-back.png) |
 
 ### 4000 EEW (Old Books / First Edition)
+
+AnkiWeb Shared Decks **(easy to use)**:
+[Book 1](https://ankiweb.net/shared/info/876489453)
+[Book 2](https://ankiweb.net/shared/info/49468437)
+[Book 3](https://ankiweb.net/shared/info/1348583674)
+[Book 4](https://ankiweb.net/shared/info/648820475)
+[Book 5](https://ankiweb.net/shared/info/893444455)
+[Book 6](https://ankiweb.net/shared/info/70990553)
 
 The original 6-book deck generated from `data/old-books/`, with contextual Hint sentences extracted from the reading passages.
 
